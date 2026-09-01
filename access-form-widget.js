@@ -209,7 +209,14 @@ const DataBridge = ({ element }) => {
   React.useEffect(function () {
     window.__accessFormBridge.allEntries = element.objectData || [];
   }, [element.objectData]);
-  return null;
+  var count = (element.objectData || []).length;
+  var debug = (element.attributes && element.attributes.debug) === "true";
+  if (!debug) return null;
+  return React.createElement(
+    "div",
+    { style: { fontSize: "11px", color: "#888" } },
+    "DEBUG: AllEntries entries received = " + count + " (isEditable=" + String(element.isEditable) + ")"
+  );
 };
 
 // ---- mode: dropdown (plain static options, comma-separated in attributes.options) ----
