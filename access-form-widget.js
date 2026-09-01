@@ -37,7 +37,8 @@ function injectStyles() {
     ".order-line-table{border-collapse:collapse;width:100%;}" +
     ".order-line-table th,.order-line-table td{border:1px solid #ccc;padding:6px 10px;text-align:left;font-size:13px;}" +
     ".order-line-table th{background:#f5f5f5;}" +
-    ".order-line-delete-btn{padding:4px 10px;cursor:pointer;}";
+    ".order-line-delete-btn{padding:4px 10px;cursor:pointer;}" +
+    ".afw-raw-json{background:#f5f5f5;border:1px solid #ccc;padding:10px;font-size:12px;white-space:pre-wrap;word-break:break-word;margin-top:8px;}";
   document.head.appendChild(style);
 }
 
@@ -71,14 +72,54 @@ function setShared(key, value) {
   window.__accessFormBridge.values[key] = value;
 }
 
+// Generic conditional-enable: if attributes.dependsOnKey is set, this field is only
+// enabled when window.__accessFormBridge.values[dependsOnKey] === attributes.enableWhen.
+// No dependsOnKey configured => always enabled (backward compatible).
+function useDependsOn(attributes) {
+  var dependsOnKey = attributes && attributes.dependsOnKey;
+  var enableWhen = attributes && attributes.enableWhen;
+  const [depValue, setDepValue] = React.useState("");
+
+  React.useEffect(function () {
+    if (!dependsOnKey) return undefined;
+    var timer = setInterval(function () {
+      var val = window.__accessFormBridge.values[dependsOnKey] || "";
+      setDepValue(function (prev) { return prev === val ? prev : val; });
+    }, 400);
+    return function () { clearInterval(timer); };
+  }, [dependsOnKey]);
+
+  if (!dependsOnKey) return true;
+  return depValue === enableWhen;
+}
+
+// The page-1 tree selection's exact wire format is opaque (custom component, no
+// source available) — try to pull a "site"-like field out of it if it's JSON,
+// otherwise fall back to treating it as an opaque blob and substring-matching.
+function extractSiteHint(rawSiteSelection) {
+  if (!rawSiteSelection) return null;
+  try {
+    var obj = JSON.parse(rawSiteSelection);
+    if (obj && typeof obj === "object") {
+      var keys = Object.keys(obj);
+      var siteKey = keys.find(function (k) { return k.toLowerCase().indexOf("site") !== -1; });
+      if (siteKey && obj[siteKey]) return String(obj[siteKey]);
+    }
+  } catch (e) {
+    // not JSON — fall through to raw blob
+  }
+  return rawSiteSelection;
+}
+
 function distinctDevicesForSite(allEntries, rawSiteSelection) {
   var entries = allEntries || [];
+  var siteHint = extractSiteHint(rawSiteSelection);
   var matching = entries;
-  if (rawSiteSelection) {
+  if (siteHint) {
     var filtered = entries.filter(function (entry) {
       var siteProp = (entry.properties || []).find(function (p) { return p.developerName === "site"; });
       var siteVal = siteProp && siteProp.contentValue;
-      return siteVal && rawSiteSelection.indexOf(siteVal) !== -1;
+      return siteVal && siteHint.indexOf(siteVal) !== -1;
     });
     if (filtered.length) matching = filtered;
   }
@@ -108,6 +149,54 @@ function portsForDevice(allEntries, deviceName) {
   });
   return ports;
 }
+
+// ---- mode: json-view (parses contentValue as JSON, renders a table + raw JSON below) ----
+const JsonView = ({ element }) => {
+  var raw = element.contentValue || "";
+  var parsed = null;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+
+  var tableEl = null;
+  if (Array.isArray(parsed) && parsed.length && typeof parsed[0] === "object" && parsed[0] !== null) {
+    var cols = Object.keys(parsed[0]);
+    tableEl = React.createElement(
+      "table",
+      { className: "order-line-table" },
+      React.createElement("thead", null, React.createElement("tr", null, cols.map(function (c) {
+        return React.createElement("th", { key: c }, c);
+      }))),
+      React.createElement("tbody", null, parsed.map(function (row, i) {
+        return React.createElement("tr", { key: i }, cols.map(function (c) {
+          return React.createElement("td", { key: c }, row[c] == null ? "" : String(row[c]));
+        }));
+      }))
+    );
+  } else if (parsed && typeof parsed === "object") {
+    var keys = Object.keys(parsed);
+    tableEl = React.createElement(
+      "table",
+      { className: "order-line-table" },
+      React.createElement("tbody", null, keys.map(function (k) {
+        var v = parsed[k];
+        var display = v && typeof v === "object" ? JSON.stringify(v) : (v == null ? "" : String(v));
+        return React.createElement("tr", { key: k }, [
+          React.createElement("th", { key: "k" }, k),
+          React.createElement("td", { key: "v" }, display),
+        ]);
+      }))
+    );
+  }
+
+  return React.createElement("div", { className: "order-line-table-wrapper" }, [
+    tableEl,
+    React.createElement("pre", { key: "raw", className: "afw-raw-json" }, raw || "(empty)"),
+  ]);
+};
+
+// ---- mode: raw-json (just the raw contentValue in a <pre>, for demonstration) ----
+const RawJson = ({ element }) => {
+  return React.createElement("pre", { className: "afw-raw-json" }, element.contentValue || "(empty)");
+};
 
 // ---- mode: data-bridge (invisible; feeds AllEntries into shared state) ----
 const DataBridge = ({ element }) => {
@@ -150,7 +239,16 @@ const DropdownField = ({ element, updateElement }) => {
 // ---- mode: textarea (free text, e.g. Comment A / Comment B) ----
 const TextareaField = ({ element, updateElement }) => {
   var fieldKey = element.attributes && element.attributes.fieldKey;
-  var current = element.contentValue || "";
+  var dependsEnabled = useDependsOn(element.attributes);
+  var enabled = element.isEditable && dependsEnabled;
+  var current = dependsEnabled ? (element.contentValue || "") : "";
+
+  React.useEffect(function () {
+    if (!dependsEnabled && element.contentValue) {
+      commit(element, updateElement, "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dependsEnabled]);
 
   React.useEffect(function () {
     if (fieldKey) setShared(fieldKey, current);
@@ -158,7 +256,7 @@ const TextareaField = ({ element, updateElement }) => {
 
   return React.createElement("textarea", {
     className: "afw-textarea",
-    disabled: !element.isEditable,
+    disabled: !enabled,
     value: current,
     onChange: function (e) {
       if (fieldKey) setShared(fieldKey, e.target.value);
@@ -173,7 +271,9 @@ const DeviceField = ({ element, updateElement }) => {
   var siteBridgeId = (element.attributes && element.attributes.siteBridgeId) || "site-bridge";
   var fallback = ((element.attributes && element.attributes.fallbackOptions) || "")
     .split(",").map(function (o) { return o.trim(); }).filter(Boolean);
-  var current = element.contentValue || "";
+  var dependsEnabled = useDependsOn(element.attributes);
+  var enabled = element.isEditable && dependsEnabled;
+  var current = dependsEnabled ? (element.contentValue || "") : "";
 
   const [options, setOptions] = React.useState([]);
 
@@ -193,6 +293,13 @@ const DeviceField = ({ element, updateElement }) => {
   }, [siteBridgeId]);
 
   React.useEffect(function () {
+    if (!dependsEnabled && element.contentValue) {
+      commit(element, updateElement, "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dependsEnabled]);
+
+  React.useEffect(function () {
     if (fieldKey) setShared(fieldKey, current);
   }, [fieldKey, current]);
 
@@ -200,7 +307,7 @@ const DeviceField = ({ element, updateElement }) => {
     "select",
     {
       className: "afw-select",
-      disabled: !element.isEditable,
+      disabled: !enabled,
       value: current,
       onChange: function (e) {
         if (fieldKey) setShared(fieldKey, e.target.value);
@@ -222,7 +329,9 @@ const InterfaceField = ({ element, updateElement }) => {
   var fieldKey = (element.attributes && element.attributes.fieldKey) || "interfaceA";
   var fallbackPorts = ((element.attributes && element.attributes.fallbackPorts) || "")
     .split(",").map(function (p) { return p.trim(); }).filter(Boolean);
-  var current = element.contentValue || "";
+  var dependsEnabled = useDependsOn(element.attributes);
+  var enabled = element.isEditable && dependsEnabled;
+  var current = dependsEnabled ? (element.contentValue || "") : "";
 
   const [ports, setPorts] = React.useState([]);
 
@@ -241,6 +350,13 @@ const InterfaceField = ({ element, updateElement }) => {
   }, [devicesKey]);
 
   React.useEffect(function () {
+    if (!dependsEnabled && element.contentValue) {
+      commit(element, updateElement, "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dependsEnabled]);
+
+  React.useEffect(function () {
     if (fieldKey) setShared(fieldKey, current);
   }, [fieldKey, current]);
 
@@ -248,7 +364,7 @@ const InterfaceField = ({ element, updateElement }) => {
     "select",
     {
       className: "afw-select",
-      disabled: !element.isEditable,
+      disabled: !enabled,
       value: current,
       onChange: function (e) {
         if (fieldKey) setShared(fieldKey, e.target.value);
@@ -425,6 +541,8 @@ const AccessFormWidget = (props) => {
   if (mode === "interface") return React.createElement(InterfaceField, props);
   if (mode === "inni-type") return React.createElement(InniTypeField, props);
   if (mode === "order-table") return React.createElement(OrderTable, props);
+  if (mode === "json-view") return React.createElement(JsonView, props);
+  if (mode === "raw-json") return React.createElement(RawJson, props);
   return React.createElement(DropdownField, props);
 };
 
