@@ -13,12 +13,25 @@ const TABLE_COLUMNS = [
   { key: "commentB", label: "Comment B" },
 ];
 
+// Shared, synchronous, in-page state — every field instance writes here directly on
+// change and reads it directly (no server round-trip, no merge-field staleness).
+if (!window.__accessFormBridge) {
+  window.__accessFormBridge = {
+    allEntries: [],
+    values: {
+      serviceOrderEnd: "", accessType: "", inniType: "", topologyType: "",
+      deviceA: "", interfaceA: "", commentA: "",
+      deviceB: "", interfaceB: "", commentB: "",
+    },
+  };
+}
+
 function injectStyles() {
   if (document.getElementById("access-form-widget-styles")) return;
   var style = document.createElement("style");
   style.id = "access-form-widget-styles";
   style.textContent =
-    ".afw-select{padding:6px;min-width:220px;}" +
+    ".afw-select,.afw-textarea{padding:6px;min-width:220px;}" +
     ".order-line-table-wrapper{margin-top:8px;}" +
     ".order-line-add-btn{margin-bottom:8px;padding:6px 14px;cursor:pointer;}" +
     ".order-line-table{border-collapse:collapse;width:100%;}" +
@@ -28,7 +41,7 @@ function injectStyles() {
   document.head.appendChild(style);
 }
 
-function readBridge(bridgeId) {
+function readBridgeDiv(bridgeId) {
   var el = document.getElementById(bridgeId);
   if (!el) return null;
   var text = el.textContent || "";
@@ -54,11 +67,66 @@ function commit(element, updateElement, value) {
   updateElement({ elementId: element.id, elementPartial: { contentValue: value } });
 }
 
+function setShared(key, value) {
+  window.__accessFormBridge.values[key] = value;
+}
+
+function distinctDevicesForSite(allEntries, rawSiteSelection) {
+  var entries = allEntries || [];
+  var matching = entries;
+  if (rawSiteSelection) {
+    var filtered = entries.filter(function (entry) {
+      var siteProp = (entry.properties || []).find(function (p) { return p.developerName === "site"; });
+      var siteVal = siteProp && siteProp.contentValue;
+      return siteVal && rawSiteSelection.indexOf(siteVal) !== -1;
+    });
+    if (filtered.length) matching = filtered;
+  }
+  var devices = [];
+  matching.forEach(function (entry) {
+    var deviceProp = (entry.properties || []).find(function (p) { return p.developerName === "device"; });
+    var deviceVal = deviceProp && deviceProp.contentValue;
+    if (deviceVal && devices.indexOf(deviceVal) === -1) devices.push(deviceVal);
+  });
+  return devices;
+}
+
+function portsForDevice(allEntries, deviceName) {
+  var entries = allEntries || [];
+  var ports = [];
+  entries.forEach(function (entry) {
+    var deviceProp = (entry.properties || []).find(function (p) { return p.developerName === "device"; });
+    var deviceVal = deviceProp && deviceProp.contentValue;
+    if (deviceVal !== deviceName) return;
+    var portsProp = (entry.properties || []).find(function (p) { return p.developerName === "ports"; });
+    var portItems = (portsProp && portsProp.objectData) || [];
+    portItems.forEach(function (item) {
+      var portProp = (item.properties || []).find(function (p) { return p.developerName === "port"; });
+      var portVal = portProp && portProp.contentValue;
+      if (portVal && ports.indexOf(portVal) === -1) ports.push(portVal);
+    });
+  });
+  return ports;
+}
+
+// ---- mode: data-bridge (invisible; feeds AllEntries into shared state) ----
+const DataBridge = ({ element }) => {
+  React.useEffect(function () {
+    window.__accessFormBridge.allEntries = element.objectData || [];
+  }, [element.objectData]);
+  return null;
+};
+
 // ---- mode: dropdown (plain static options, comma-separated in attributes.options) ----
 const DropdownField = ({ element, updateElement }) => {
   var opts = (element.attributes && element.attributes.options) || "";
   var options = opts.split(",").map(function (o) { return o.trim(); }).filter(Boolean);
+  var fieldKey = element.attributes && element.attributes.fieldKey;
   var current = element.contentValue || "";
+
+  React.useEffect(function () {
+    if (fieldKey) setShared(fieldKey, current);
+  }, [fieldKey, current]);
 
   return React.createElement(
     "select",
@@ -67,6 +135,7 @@ const DropdownField = ({ element, updateElement }) => {
       disabled: !element.isEditable,
       value: current,
       onChange: function (e) {
+        if (fieldKey) setShared(fieldKey, e.target.value);
         commit(element, updateElement, e.target.value);
       },
     },
@@ -78,64 +147,54 @@ const DropdownField = ({ element, updateElement }) => {
   );
 };
 
-// ---- mode: inni-type (enabled + "NTU" only when Access Type == INNI, else disabled + cleared) ----
-const InniTypeField = ({ element, updateElement }) => {
-  var bridgeId = (element.attributes && element.attributes.bridgeId) || "field-bridge";
-  var dependsOnKey = (element.attributes && element.attributes.dependsOnKey) || "AccessType";
-  var enableWhen = (element.attributes && element.attributes.enableWhen) || "INNI";
-  var option = (element.attributes && element.attributes.option) || "NTU";
+// ---- mode: textarea (free text, e.g. Comment A / Comment B) ----
+const TextareaField = ({ element, updateElement }) => {
+  var fieldKey = element.attributes && element.attributes.fieldKey;
+  var current = element.contentValue || "";
 
-  const [accessType, setAccessType] = React.useState("");
+  React.useEffect(function () {
+    if (fieldKey) setShared(fieldKey, current);
+  }, [fieldKey, current]);
+
+  return React.createElement("textarea", {
+    className: "afw-textarea",
+    disabled: !element.isEditable,
+    value: current,
+    onChange: function (e) {
+      if (fieldKey) setShared(fieldKey, e.target.value);
+      commit(element, updateElement, e.target.value);
+    },
+  });
+};
+
+// ---- mode: device (options = distinct devices from AllEntries, scoped to page-1 site) ----
+const DeviceField = ({ element, updateElement }) => {
+  var fieldKey = (element.attributes && element.attributes.fieldKey) || "deviceA";
+  var siteBridgeId = (element.attributes && element.attributes.siteBridgeId) || "site-bridge";
+  var fallback = ((element.attributes && element.attributes.fallbackOptions) || "")
+    .split(",").map(function (o) { return o.trim(); }).filter(Boolean);
+  var current = element.contentValue || "";
+
+  const [options, setOptions] = React.useState([]);
 
   React.useEffect(function () {
     var timer = setInterval(function () {
-      var bridge = readBridge(bridgeId);
-      if (!bridge) return;
-      var val = bridge[dependsOnKey] || "";
-      setAccessType(function (prev) {
-        if (prev !== val) return val;
-        return prev;
+      var bridge = readBridgeDiv(siteBridgeId);
+      var rawSite = bridge ? bridge.SiteSelection : null;
+      var devices = distinctDevicesForSite(window.__accessFormBridge.allEntries, rawSite);
+      if (!devices.length) devices = fallback;
+      setOptions(function (prev) {
+        var same = prev.length === devices.length && prev.every(function (v, i) { return v === devices[i]; });
+        return same ? prev : devices;
       });
     }, 400);
     return function () { clearInterval(timer); };
-  }, [bridgeId, dependsOnKey]);
-
-  const enabled = accessType === enableWhen;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [siteBridgeId]);
 
   React.useEffect(function () {
-    if (!enabled && element.contentValue) {
-      commit(element, updateElement, "");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled]);
-
-  var current = enabled ? (element.contentValue || "") : "";
-
-  return React.createElement(
-    "select",
-    {
-      className: "afw-select",
-      disabled: !element.isEditable || !enabled,
-      value: current,
-      onChange: function (e) {
-        commit(element, updateElement, e.target.value);
-      },
-    },
-    [
-      React.createElement("option", { key: "__blank", value: "" }, "-- Select --"),
-      React.createElement("option", { key: option, value: option }, option),
-    ]
-  );
-};
-
-// ---- mode: interface (port-number list, value/label = prefix + port, e.g. GigaEthernet0/0/0/1) ----
-const InterfaceField = ({ element, updateElement }) => {
-  var prefix = (element.attributes && element.attributes.prefix) || "GigaEthernet";
-  var ports = ((element.attributes && element.attributes.ports) || "")
-    .split(",")
-    .map(function (p) { return p.trim(); })
-    .filter(Boolean);
-  var current = element.contentValue || "";
+    if (fieldKey) setShared(fieldKey, current);
+  }, [fieldKey, current]);
 
   return React.createElement(
     "select",
@@ -144,6 +203,55 @@ const InterfaceField = ({ element, updateElement }) => {
       disabled: !element.isEditable,
       value: current,
       onChange: function (e) {
+        if (fieldKey) setShared(fieldKey, e.target.value);
+        commit(element, updateElement, e.target.value);
+      },
+    },
+    [React.createElement("option", { key: "__blank", value: "" }, "-- Select --")].concat(
+      options.map(function (o) {
+        return React.createElement("option", { key: o, value: o }, o);
+      })
+    )
+  );
+};
+
+// ---- mode: interface (ports for the currently selected Device A/B, value = prefix+port) ----
+const InterfaceField = ({ element, updateElement }) => {
+  var prefix = (element.attributes && element.attributes.prefix) || "GigaEthernet";
+  var devicesKey = (element.attributes && element.attributes.devicesKey) || "deviceA";
+  var fieldKey = (element.attributes && element.attributes.fieldKey) || "interfaceA";
+  var fallbackPorts = ((element.attributes && element.attributes.fallbackPorts) || "")
+    .split(",").map(function (p) { return p.trim(); }).filter(Boolean);
+  var current = element.contentValue || "";
+
+  const [ports, setPorts] = React.useState([]);
+
+  React.useEffect(function () {
+    var timer = setInterval(function () {
+      var deviceName = window.__accessFormBridge.values[devicesKey];
+      var found = deviceName ? portsForDevice(window.__accessFormBridge.allEntries, deviceName) : [];
+      if (!found.length) found = fallbackPorts;
+      setPorts(function (prev) {
+        var same = prev.length === found.length && prev.every(function (v, i) { return v === found[i]; });
+        return same ? prev : found;
+      });
+    }, 400);
+    return function () { clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devicesKey]);
+
+  React.useEffect(function () {
+    if (fieldKey) setShared(fieldKey, current);
+  }, [fieldKey, current]);
+
+  return React.createElement(
+    "select",
+    {
+      className: "afw-select",
+      disabled: !element.isEditable,
+      value: current,
+      onChange: function (e) {
+        if (fieldKey) setShared(fieldKey, e.target.value);
         commit(element, updateElement, e.target.value);
       },
     },
@@ -156,10 +264,59 @@ const InterfaceField = ({ element, updateElement }) => {
   );
 };
 
-// ---- mode: order-table (Add/Delete rows, reads field-bridge for current field values) ----
-const OrderTable = ({ element, updateElement }) => {
-  var bridgeId = (element.attributes && element.attributes.bridgeId) || "field-bridge";
+// ---- mode: inni-type (enabled + "NTU" only when Access Type == INNI, else disabled + cleared) ----
+const InniTypeField = ({ element, updateElement }) => {
+  var dependsOnKey = (element.attributes && element.attributes.dependsOnKey) || "accessType";
+  var enableWhen = (element.attributes && element.attributes.enableWhen) || "INNI";
+  var option = (element.attributes && element.attributes.option) || "NTU";
+  var fieldKey = (element.attributes && element.attributes.fieldKey) || "inniType";
 
+  const [dependsOnValue, setDependsOnValue] = React.useState("");
+
+  React.useEffect(function () {
+    var timer = setInterval(function () {
+      var val = window.__accessFormBridge.values[dependsOnKey] || "";
+      setDependsOnValue(function (prev) { return prev === val ? prev : val; });
+    }, 400);
+    return function () { clearInterval(timer); };
+  }, [dependsOnKey]);
+
+  const enabled = dependsOnValue === enableWhen;
+
+  React.useEffect(function () {
+    if (!enabled && element.contentValue) {
+      commit(element, updateElement, "");
+      setShared(fieldKey, "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
+
+  var current = enabled ? (element.contentValue || "") : "";
+
+  React.useEffect(function () {
+    setShared(fieldKey, current);
+  }, [fieldKey, current]);
+
+  return React.createElement(
+    "select",
+    {
+      className: "afw-select",
+      disabled: !element.isEditable || !enabled,
+      value: current,
+      onChange: function (e) {
+        setShared(fieldKey, e.target.value);
+        commit(element, updateElement, e.target.value);
+      },
+    },
+    [
+      React.createElement("option", { key: "__blank", value: "" }, "-- Select --"),
+      React.createElement("option", { key: option, value: option }, option),
+    ]
+  );
+};
+
+// ---- mode: order-table (Add/Delete rows, reads shared state directly) ----
+const OrderTable = ({ element, updateElement }) => {
   const [rows, setRows] = React.useState(function () {
     return parseRows(element.contentValue);
   });
@@ -175,19 +332,18 @@ const OrderTable = ({ element, updateElement }) => {
 
   const handleAdd = function () {
     if (!element.isEditable) return;
-    var bridge = readBridge(bridgeId);
-    if (!bridge) return;
+    var v = window.__accessFormBridge.values;
     var row = {
-      serviceOrderEnd: bridge.ServiceOrderEnd || "",
-      accessType: bridge.AccessType || "",
-      inniType: bridge.INNIType || "",
-      topologyType: bridge.TopologyType || "",
-      deviceA: bridge.DeviceA || "",
-      interfaceA: bridge.InterfaceA || "",
-      commentA: bridge.CommentA || "",
-      deviceB: bridge.DeviceB || "",
-      interfaceB: bridge.InterfaceB || "",
-      commentB: bridge.CommentB || "",
+      serviceOrderEnd: v.serviceOrderEnd || "",
+      accessType: v.accessType || "",
+      inniType: v.inniType || "",
+      topologyType: v.topologyType || "",
+      deviceA: v.deviceA || "",
+      interfaceA: v.interfaceA || "",
+      commentA: v.commentA || "",
+      deviceB: v.deviceB || "",
+      interfaceB: v.interfaceB || "",
+      commentB: v.commentB || "",
     };
     persist(rows.concat([row]));
   };
@@ -263,8 +419,11 @@ const OrderTable = ({ element, updateElement }) => {
 const AccessFormWidget = (props) => {
   injectStyles();
   var mode = (props.element.attributes && props.element.attributes.mode) || "dropdown";
-  if (mode === "inni-type") return React.createElement(InniTypeField, props);
+  if (mode === "data-bridge") return React.createElement(DataBridge, props);
+  if (mode === "textarea") return React.createElement(TextareaField, props);
+  if (mode === "device") return React.createElement(DeviceField, props);
   if (mode === "interface") return React.createElement(InterfaceField, props);
+  if (mode === "inni-type") return React.createElement(InniTypeField, props);
   if (mode === "order-table") return React.createElement(OrderTable, props);
   return React.createElement(DropdownField, props);
 };
