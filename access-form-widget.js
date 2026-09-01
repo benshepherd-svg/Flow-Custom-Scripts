@@ -111,7 +111,7 @@ function extractSiteHint(rawSiteSelection) {
   return rawSiteSelection;
 }
 
-function distinctDevicesForSite(allEntries, rawSiteSelection) {
+function entriesForSite(allEntries, rawSiteSelection) {
   var entries = allEntries || [];
   var siteHint = extractSiteHint(rawSiteSelection);
   var matching = entries;
@@ -123,6 +123,13 @@ function distinctDevicesForSite(allEntries, rawSiteSelection) {
     });
     if (filtered.length) matching = filtered;
   }
+  return matching;
+}
+
+// Site-wide (not per-device) — every Device dropdown shows the same list: all
+// devices belonging to the site picked on page 1.
+function distinctDevicesForSite(allEntries, rawSiteSelection) {
+  var matching = entriesForSite(allEntries, rawSiteSelection);
   var devices = [];
   matching.forEach(function (entry) {
     var deviceProp = (entry.properties || []).find(function (p) { return p.developerName === "device"; });
@@ -132,13 +139,12 @@ function distinctDevicesForSite(allEntries, rawSiteSelection) {
   return devices;
 }
 
-function portsForDevice(allEntries, deviceName) {
-  var entries = allEntries || [];
+// Site-wide (not per-device) — every Interface dropdown shows the same list: all
+// ports across every device at the site picked on page 1 (matches page 1's tree).
+function distinctPortsForSite(allEntries, rawSiteSelection) {
+  var matching = entriesForSite(allEntries, rawSiteSelection);
   var ports = [];
-  entries.forEach(function (entry) {
-    var deviceProp = (entry.properties || []).find(function (p) { return p.developerName === "device"; });
-    var deviceVal = deviceProp && deviceProp.contentValue;
-    if (deviceVal !== deviceName) return;
+  matching.forEach(function (entry) {
     var portsProp = (entry.properties || []).find(function (p) { return p.developerName === "ports"; });
     var portItems = (portsProp && portsProp.objectData) || [];
     portItems.forEach(function (item) {
@@ -325,7 +331,7 @@ const DeviceField = ({ element, updateElement }) => {
 // ---- mode: interface (ports for the currently selected Device A/B, value = prefix+port) ----
 const InterfaceField = ({ element, updateElement }) => {
   var prefix = (element.attributes && element.attributes.prefix) || "GigaEthernet";
-  var devicesKey = (element.attributes && element.attributes.devicesKey) || "deviceA";
+  var siteBridgeId = (element.attributes && element.attributes.siteBridgeId) || "site-bridge";
   var fieldKey = (element.attributes && element.attributes.fieldKey) || "interfaceA";
   var fallbackPorts = ((element.attributes && element.attributes.fallbackPorts) || "")
     .split(",").map(function (p) { return p.trim(); }).filter(Boolean);
@@ -337,8 +343,9 @@ const InterfaceField = ({ element, updateElement }) => {
 
   React.useEffect(function () {
     var timer = setInterval(function () {
-      var deviceName = window.__accessFormBridge.values[devicesKey];
-      var found = deviceName ? portsForDevice(window.__accessFormBridge.allEntries, deviceName) : [];
+      var bridge = readBridgeDiv(siteBridgeId);
+      var rawSite = bridge ? bridge.SiteSelection : null;
+      var found = distinctPortsForSite(window.__accessFormBridge.allEntries, rawSite);
       if (!found.length) found = fallbackPorts;
       setPorts(function (prev) {
         var same = prev.length === found.length && prev.every(function (v, i) { return v === found[i]; });
@@ -347,7 +354,7 @@ const InterfaceField = ({ element, updateElement }) => {
     }, 400);
     return function () { clearInterval(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devicesKey]);
+  }, [siteBridgeId]);
 
   React.useEffect(function () {
     if (!dependsEnabled && element.contentValue) {
